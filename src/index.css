@@ -1,0 +1,170 @@
+@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 60 30% 96%;
+    --foreground: 160 25% 12%;
+
+    --card: 60 20% 99%;
+    --card-foreground: 160 25% 12%;
+
+    --popover: 60 20% 99%;
+    --popover-foreground: 160 25% 12%;
+
+    --primary: 152 60% 28%;
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 152 30% 90%;
+    --secondary-foreground: 160 25% 12%;
+
+    --muted: 80 15% 91%;
+    --muted-foreground: 160 10% 46%;
+
+    --accent: 45 90% 55%;
+    --accent-foreground: 160 25% 12%;
+
+    --destructive: 0 75% 55%;
+    --destructive-foreground: 0 0% 100%;
+
+    --success: 152 70% 40%;
+    --success-foreground: 0 0% 100%;
+
+    --info: 200 80% 50%;
+    --info-foreground: 0 0% 100%;
+
+    --border: 160 25% 12%;
+    --input: 160 25% 12%;
+    --ring: 152 60% 28%;
+
+    --radius: 0.75rem;
+
+    --sidebar-background: 60 20% 99%;
+    --sidebar-foreground: 160 25% 12%;
+    --sidebar-primary: 152 60% 28%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 60 30% 96%;
+    --sidebar-accent-foreground: 160 25% 12%;
+    --sidebar-border: 160 25% 12%;
+    --sidebar-ring: 152 60% 28%;
+
+    --shadow-brutal: 6px 6px 0px 0px hsl(160 25% 12%);
+    --shadow-brutal-sm: 4px 4px 0px 0px hsl(160 25% 12%);
+    --shadow-brutal-hover: 2px 2px 0px 0px hsl(160 25% 12%);
+    --neo-shadow: 4px 4px 0px 0px hsl(160 25% 12%);
+    --neo-shadow-sm: 2px 2px 0px 0px hsl(160 25% 12%);
+    --neo-shadow-hover: 6px 6px 0px 0px hsl(160 25% 12%);
+  }
+
+  .dark {
+    --background: 160 20% 10%;
+    --foreground: 60 30% 96%;
+    --card: 160 18% 14%;
+    --card-foreground: 60 30% 96%;
+    --popover: 160 18% 14%;
+    --popover-foreground: 60 30% 96%;
+    --primary: 152 60% 28%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 160 15% 20%;
+    --secondary-foreground: 60 30% 96%;
+    --muted: 160 15% 20%;
+    --muted-foreground: 160 10% 60%;
+    --accent: 45 90% 55%;
+    --accent-foreground: 160 25% 12%;
+    --destructive: 0 62% 30%;
+    --destructive-foreground: 0 0% 100%;
+    --success: 152 70% 40%;
+    --success-foreground: 0 0% 100%;
+    --info: 200 80% 50%;
+    --info-foreground: 0 0% 100%;
+    --border: 160 10% 30%;
+    --input: 160 10% 30%;
+    --ring: 152 60% 28%;
+    --sidebar-background: 160 18% 14%;
+    --sidebar-foreground: 60 30% 96%;
+    --sidebar-primary: 152 60% 28%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 160 15% 20%;
+    --sidebar-accent-foreground: 60 30% 96%;
+    --sidebar-border: 160 10% 30%;
+    --sidebar-ring: 152 60% 28%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-family: 'Plus Jakarta Sans', 'Inter', sans-serif;
+  }
+  h1, h2, h3, h4, h5, h6 {
+    font-family: 'Plus Jakarta Sans', 'Space Grotesk', sans-serif;
+  }
+}
+
+@layer components {
+  .neo-card {
+    @apply bg-card border-2 border-foreground rounded-xl p-4;
+    box-shadow: var(--shadow-brutal);
+  }
+  .neo-card-hover {
+    @apply neo-card transition-all;
+  }
+  .neo-card-hover:hover {
+    box-shadow: var(--shadow-brutal-hover);
+    transform: translate(2px, 2px);
+  }
+  .neo-input {
+    @apply w-full p-2.5 border-2 border-foreground rounded-xl bg-card text-foreground focus:outline-none focus:ring-0 focus:border-primary transition-colors;
+    box-shadow: var(--shadow-brutal-sm);
+  }
+  .neo-btn {
+    @apply inline-flex items-center justify-center gap-2 px-4 py-2.5 border-2 border-foreground rounded-xl font-bold uppercase tracking-wide text-sm transition-all;
+    box-shadow: var(--shadow-brutal);
+  }
+  .neo-btn:hover {
+    box-shadow: var(--shadow-brutal-hover);
+    transform: translate(2px, 2px);
+  }
+  .neo-btn:active {
+    box-shadow: none;
+    transform: translate(4px, 4px);
+  }
+  .neo-btn-primary {
+    @apply neo-btn bg-primary text-primary-foreground;
+  }
+  .neo-badge {
+    @apply inline-flex items-center px-2 py-0.5 border-2 border-foreground rounded-md text-xs font-bold uppercase;
+    box-shadow: var(--shadow-brutal-sm);
+  }
+
+  /* A4 preview styling */
+  .a4-page {
+    width: 210mm;
+    max-width: 100%;
+    min-height: 297mm;
+    padding: 20mm;
+    @apply bg-white mx-auto text-black;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.15);
+  }
+
+  @media print {
+    .a4-page {
+      box-shadow: none;
+      margin: 0;
+      padding: 20mm;
+    }
+  }
+}
+
+@layer utilities {
+  .bg-grid-pattern {
+    background-image: radial-gradient(circle, hsl(var(--foreground)) 1px, transparent 1px);
+    background-size: 24px 24px;
+  }
+}
