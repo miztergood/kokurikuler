@@ -19,10 +19,34 @@ interface AuthContextType {
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
 export function AuthProvider({ children }: { children: ReactNode }) {
-  const [user, setUser] = useState<User | null>(null);
-  const [session, setSession] = useState<Session | null>(null);
-  const [role, setRole] = useState<AppRole | null>(null);
-  const [isLoading, setIsLoading] = useState(true);
+  const [user, setUser] = useState<User | null>(() => {
+    try {
+      const saved = localStorage.getItem("kokurikuler_auth_user");
+      return saved ? JSON.parse(saved) : null;
+    } catch {
+      return null;
+    }
+  });
+
+  const [session, setSession] = useState<Session | null>(() => {
+    try {
+      const saved = localStorage.getItem("kokurikuler_auth_session");
+      return saved ? JSON.parse(saved) : null;
+    } catch {
+      return null;
+    }
+  });
+
+  const [role, setRole] = useState<AppRole | null>(() => {
+    try {
+      const saved = localStorage.getItem("kokurikuler_auth_role");
+      return (saved as AppRole) || null;
+    } catch {
+      return null;
+    }
+  });
+
+  const [isLoading, setIsLoading] = useState<boolean>(!user);
 
   const fetchRole = useCallback(async (userId: string) => {
     try {
@@ -32,12 +56,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         .eq("user_id", userId);
       if (!error && Array.isArray(data) && data.length > 0) {
         const isAdmin = data.some((r: any) => r.role === "admin");
-        setRole(isAdmin ? "admin" : "user");
+        const userRole = isAdmin ? "admin" : "user";
+        setRole(userRole);
+        localStorage.setItem("kokurikuler_auth_role", userRole);
       } else {
         setRole("user");
+        localStorage.setItem("kokurikuler_auth_role", "user");
       }
     } catch {
       setRole("user");
+      localStorage.setItem("kokurikuler_auth_role", "user");
     }
   }, []);
 
@@ -46,25 +74,39 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [user, fetchRole]);
 
   useEffect(() => {
-    // Setup listener BEFORE getSession
+    // 1. Setup onAuthStateChange listener
     const { data: { subscription } } = supabase.auth.onAuthStateChange(async (_event, session) => {
-      setSession(session);
-      setUser(session?.user ?? null);
       if (session?.user) {
-        // Use setTimeout to avoid Supabase deadlock
-        setTimeout(() => fetchRole(session.user.id), 0);
-      } else {
-        setRole(null);
+        setSession(session);
+        setUser(session.user);
+        localStorage.setItem("kokurikuler_auth_user", JSON.stringify(session.user));
+        localStorage.setItem("kokurikuler_auth_session", JSON.stringify(session));
+        fetchRole(session.user.id);
       }
       setIsLoading(false);
     });
 
+    // 2. Fetch session from server/adapter
     supabase.auth.getSession().then(({ data: { session } }) => {
-      setSession(session);
-      setUser(session?.user ?? null);
       if (session?.user) {
+        setSession(session);
+        setUser(session.user);
+        localStorage.setItem("kokurikuler_auth_user", JSON.stringify(session.user));
+        localStorage.setItem("kokurikuler_auth_session", JSON.stringify(session));
         fetchRole(session.user.id);
+      } else {
+        // Fallback: if we had a saved user in storage
+        const savedUserStr = localStorage.getItem("kokurikuler_auth_user");
+        if (savedUserStr) {
+          try {
+            const savedUser = JSON.parse(savedUserStr);
+            setUser(savedUser);
+            fetchRole(savedUser.id);
+          } catch {}
+        }
       }
+      setIsLoading(false);
+    }).catch(() => {
       setIsLoading(false);
     });
 
@@ -101,15 +143,72 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   };
 
   const signIn = async (email: string, password: string) => {
-    const { error } = await supabase.auth.signInWithPassword({ email, password });
-    return { error: error as Error | null };
+    try {
+      // 1. Attempt standard signInWithPassword
+      const res = await supabase.auth.signInWithPassword({ email, password });
+
+      let loggedInUser: User | null = (res.data?.user || res.data?.session?.user) ?? null;
+      let loggedInSession: Session | null = res.data?.session ?? null;
+
+      // 2. If standard signIn failed (e.g. third-party cookie blocked in incognito causing session fetch fail)
+      if (!loggedInUser && (supabase.auth as any)._betterAuth?.signIn?.email) {
+        try {
+          const baRes = await (supabase.auth as any)._betterAuth.signIn.email({ email, password });
+          if (!baRes.error && baRes.data?.user) {
+            const baUser = baRes.data.user;
+            loggedInUser = {
+              id: baUser.id,
+              email: baUser.email,
+              user_metadata: { displayName: baUser.name },
+              app_metadata: {},
+              aud: "authenticated",
+              created_at: baUser.createdAt,
+            } as any;
+            loggedInSession = {
+              access_token: baRes.data.token,
+              token_type: "bearer",
+              expires_in: 604800,
+              user: loggedInUser,
+            } as any;
+          }
+        } catch (baErr) {
+          console.error("Better Auth direct signIn fallback error:", baErr);
+        }
+      }
+
+      if (!loggedInUser) {
+        return { error: (res.error as Error) || new Error("Gagal masuk. Periksa kembali email dan password Anda.") };
+      }
+
+      // Synchronously update state and localStorage
+      setUser(loggedInUser);
+      if (loggedInSession) setSession(loggedInSession);
+      localStorage.setItem("kokurikuler_auth_user", JSON.stringify(loggedInUser));
+      if (loggedInSession) {
+        localStorage.setItem("kokurikuler_auth_session", JSON.stringify(loggedInSession));
+      }
+
+      // Fetch role before returning
+      await fetchRole(loggedInUser.id);
+
+      return { error: null };
+    } catch (err: any) {
+      return { error: err as Error };
+    }
   };
 
   const signOut = async () => {
-    await supabase.auth.signOut();
+    try {
+      await supabase.auth.signOut();
+    } catch (e) {
+      console.warn("Sign out error ignored:", e);
+    }
     setUser(null);
     setSession(null);
     setRole(null);
+    localStorage.removeItem("kokurikuler_auth_user");
+    localStorage.removeItem("kokurikuler_auth_session");
+    localStorage.removeItem("kokurikuler_auth_role");
   };
 
   return (
