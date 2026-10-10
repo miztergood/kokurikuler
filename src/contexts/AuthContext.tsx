@@ -29,10 +29,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       const { data, error } = await supabase
         .from("user_roles")
         .select("role")
-        .eq("user_id", userId)
-        .maybeSingle();
-      if (!error && data) {
-        setRole(data.role as AppRole);
+        .eq("user_id", userId);
+      if (!error && Array.isArray(data) && data.length > 0) {
+        const isAdmin = data.some((r: any) => r.role === "admin");
+        setRole(isAdmin ? "admin" : "user");
       } else {
         setRole("user");
       }
@@ -72,7 +72,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [fetchRole]);
 
   const signUp = async (email: string, password: string, displayName?: string) => {
-    const { error } = await supabase.auth.signUp({
+    const res = await supabase.auth.signUp({
       email,
       password,
       options: {
@@ -80,7 +80,24 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         emailRedirectTo: window.location.origin,
       },
     });
-    return { error: error as Error | null };
+
+    // If user already exists (pre-migrated account claiming password for first time)
+    if (
+      res.error &&
+      (res.error.message?.toLowerCase().includes("already exists") ||
+        (res.error as any).code === "USER_ALREADY_EXISTS_USE_ANOTHER_EMAIL" ||
+        (res.error as any).status === 422)
+    ) {
+      const claimRes = await supabase.functions.invoke("claim-account", {
+        body: { email, password, displayName },
+      });
+      if (claimRes.error) {
+        return { error: claimRes.error as Error };
+      }
+      return { error: null };
+    }
+
+    return { error: res.error as Error | null };
   };
 
   const signIn = async (email: string, password: string) => {

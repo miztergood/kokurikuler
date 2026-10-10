@@ -1,4 +1,5 @@
 import { neon } from "@neondatabase/serverless";
+import crypto from "node:crypto";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -258,6 +259,75 @@ export default async function handler(req: Request): Promise<Response> {
       `;
 
       return new Response(JSON.stringify({ success: true, message: "User password reset successfully" }), {
+        status: 200,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    } catch (e: any) {
+      return new Response(JSON.stringify({ error: e.message || String(e) }), {
+        status: 500,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+  }
+
+  // 3. Claim Account (Set initial password for pre-migrated users)
+  if (path.includes("claim-account")) {
+    try {
+      const { email, password } = (await req.json()) as any;
+      if (!email || !password || password.length < 6) {
+        return new Response(JSON.stringify({ error: "Password minimal 6 karakter" }), {
+          status: 400,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+
+      // Check if user exists in neon_auth.user
+      const userRows = await sql`
+        SELECT id, name FROM neon_auth.user WHERE lower(email) = lower(${email}) LIMIT 1;
+      `;
+      if (userRows.length === 0) {
+        return new Response(JSON.stringify({ error: "Email tidak ditemukan atau belum terdaftar." }), {
+          status: 404,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+      const userId = userRows[0].id;
+
+      // Check if credential password already exists
+      const existingAccount = await sql`
+        SELECT id FROM neon_auth.account WHERE "userId" = ${userId}::uuid AND "providerId" = 'credential' LIMIT 1;
+      `;
+      if (existingAccount.length > 0) {
+        return new Response(JSON.stringify({ error: "Akun ini sudah memiliki password. Silakan masuk dengan password Anda." }), {
+          status: 400,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+
+      // Hash password with Better Auth compatible scrypt (salt hex + key hex)
+      const salt = crypto.randomBytes(16).toString("hex");
+      const key = crypto.scryptSync(password.normalize("NFKC"), salt, 64, {
+        N: 16384,
+        r: 16,
+        p: 1,
+        maxmem: 128 * 16384 * 16 * 2,
+      });
+      const hashedPassword = `${salt}:${key.toString("hex")}`;
+
+      // Insert account
+      await sql`
+        INSERT INTO neon_auth.account ("id", "accountId", "providerId", "userId", "password", "createdAt", "updatedAt")
+        VALUES (gen_random_uuid(), ${userId}::text, 'credential', ${userId}::uuid, ${hashedPassword}, NOW(), NOW());
+      `;
+
+      // Update allowed_customers if present
+      await sql`
+        UPDATE public.allowed_customers
+        SET is_claimed = true, claimed_at = NOW(), user_id = ${userId}::uuid
+        WHERE lower(email) = lower(${email});
+      `;
+
+      return new Response(JSON.stringify({ success: true }), {
         status: 200,
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
