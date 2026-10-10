@@ -9,17 +9,50 @@ const corsHeaders = {
 
 const GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-3-flash"];
 
-function parseJwtSub(authHeader: string | null): string | null {
+function hashPassword(password: string): string {
+  const salt = crypto.randomBytes(16).toString("hex");
+  const key = crypto.scryptSync(password.normalize("NFKC"), salt, 64, {
+    N: 16384,
+    r: 16,
+    p: 1,
+    maxmem: 128 * 16384 * 16 * 2,
+  });
+  return `${salt}:${key.toString("hex")}`;
+}
+
+async function getUserIdFromAuthHeader(sqlInstance: any, authHeader: string | null): Promise<string | null> {
   if (!authHeader?.startsWith("Bearer ")) return null;
-  const token = authHeader.slice(7);
-  try {
-    const parts = token.split(".");
-    if (parts.length < 2) return null;
-    const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf-8"));
-    return payload.sub || payload.userId || null;
-  } catch {
-    return null;
+  const token = authHeader.slice(7).trim();
+  if (!token) return null;
+
+  // 1. Check if token is a JWT
+  if (token.includes(".")) {
+    try {
+      const parts = token.split(".");
+      if (parts.length >= 2) {
+        const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf-8"));
+        if (payload.sub || payload.userId) return String(payload.sub || payload.userId);
+      }
+    } catch {
+      // not a JWT
+    }
   }
+
+  // 2. Check if token is a Better Auth session token in neon_auth.session
+  try {
+    const sessionRows = await sqlInstance`
+      SELECT "userId" FROM neon_auth.session 
+      WHERE token = ${token} AND "expiresAt" > NOW() 
+      LIMIT 1;
+    `;
+    if (sessionRows.length > 0 && sessionRows[0]?.userId) {
+      return String(sessionRows[0].userId);
+    }
+  } catch (err) {
+    console.error("Error looking up session token:", err);
+  }
+
+  return null;
 }
 
 function sanitizeJsonResponse(text: string): string {
@@ -104,7 +137,7 @@ export default async function handler(req: Request): Promise<Response> {
   // 1. Generate Content Function
   if (path.includes("generate-content")) {
     try {
-      const userId = parseJwtSub(req.headers.get("Authorization"));
+      const userId = await getUserIdFromAuthHeader(sql, req.headers.get("Authorization"));
       if (!userId) {
         return new Response(JSON.stringify({ success: false, error: "Unauthorized", errorCode: "unauthorized" }), {
           status: 401,
@@ -138,71 +171,72 @@ export default async function handler(req: Request): Promise<Response> {
       }
 
       let finalPrompt: string;
-      let maxOutputTokens = 8192;
-      let temperature = 0.7;
-
       if (type === "test") {
-        finalPrompt = "Say 'test successful' in 2 words";
-        maxOutputTokens = 10;
+        finalPrompt = "Balas hanya dengan satu kata: 'BERHASIL'";
+      } else if (userPrompt) {
+        finalPrompt = userPrompt;
       } else {
-        finalPrompt = userPrompt || JSON.stringify(requestData);
+        finalPrompt = JSON.stringify(requestData || {});
       }
 
-      // Collect API keys: Personal keys first
-      let keysToTry: string[] = [];
-      if (!isTrial) {
-        const personalKeys = await sql`
-          SELECT api_key FROM public.user_api_keys WHERE user_id = ${userId}::uuid AND is_active = true;
-        `;
-        keysToTry = personalKeys.map((k: any) => k.api_key);
-      }
-
-      // Add demo keys
-      const demoKeys = await sql`
-        SELECT api_key FROM public.demo_api_keys WHERE is_active = true ORDER BY created_at ASC;
+      // Get API Key (tier 1: user, tier 2: admin app_settings, tier 3: env)
+      let apiKey = "";
+      const profileRows = await sql`
+        SELECT api_key FROM public.profiles WHERE user_id = ${userId}::uuid LIMIT 1;
       `;
-      const demoKeyList = demoKeys.map((k: any) => k.api_key);
-      keysToTry.push(...demoKeyList);
+      if (profileRows[0]?.api_key) apiKey = profileRows[0].api_key;
 
-      if (keysToTry.length === 0) {
+      if (!apiKey) {
+        const settingRows = await sql`
+          SELECT value FROM public.app_settings WHERE key = 'gemini_api_key' LIMIT 1;
+        `;
+        if (settingRows[0]?.value) apiKey = settingRows[0].value;
+      }
+
+      if (!apiKey) {
+        apiKey = process.env.GEMINI_API_KEY || "";
+      }
+
+      if (!apiKey) {
         return new Response(JSON.stringify({
           success: false,
-          error: "Tidak ada API key tersedia. Silakan masukkan Gemini API Key di Pengaturan.",
-          errorCode: "no_keys_available",
-        }), { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+          error: "API Key Gemini belum dikonfigurasi. Hubungi admin atau atur di Pengaturan Akun.",
+          errorCode: "missing_api_key",
+        }), { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } });
       }
 
-      let generatedText: string | undefined;
-      let usedModel: string | undefined;
-      let lastError: string | undefined;
+      let generatedText = "";
+      let usedModel = "";
+      let lastError = "";
 
-      for (const key of keysToTry) {
-        for (const model of GEMINI_MODELS) {
-          const res = await callGeminiNative(key, model, finalPrompt, maxOutputTokens, temperature);
-          if (res.success && res.text) {
-            generatedText = res.text;
-            usedModel = model;
-            break;
-          }
-          lastError = res.error;
+      for (const m of GEMINI_MODELS) {
+        const res = await callGeminiNative(apiKey, m, finalPrompt);
+        if (res.success && res.text) {
+          generatedText = res.text;
+          usedModel = m;
+          break;
+        } else {
+          lastError = res.error || "Unknown error";
         }
-        if (generatedText) break;
       }
 
       if (!generatedText) {
         return new Response(JSON.stringify({
           success: false,
-          error: lastError || "Gagal memproses dengan Gemini API",
-          errorCode: "generation_failed",
-        }), { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+          error: `Gagal generate dari semua model: ${lastError}`,
+          errorCode: "model_error",
+        }), { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } });
       }
 
-      // Save log
       if (type !== "test") {
-        await sql`
-          INSERT INTO public.generation_logs (user_id, content_type, metadata)
-          VALUES (${userId}::uuid, ${type || "generation"}, ${JSON.stringify({ model: usedModel })}::jsonb);
-        `;
+        try {
+          await sql`
+            INSERT INTO public.generation_logs (user_id, content_type, prompt, created_at)
+            VALUES (${userId}::uuid, ${type || "general"}, ${finalPrompt.slice(0, 500)}, NOW());
+          `;
+        } catch {
+          // non-critical
+        }
       }
 
       return new Response(JSON.stringify({
@@ -222,7 +256,7 @@ export default async function handler(req: Request): Promise<Response> {
   // 2. Admin Reset Password Function
   if (path.includes("admin-reset-password")) {
     try {
-      const callerId = parseJwtSub(req.headers.get("Authorization"));
+      const callerId = await getUserIdFromAuthHeader(sql, req.headers.get("Authorization"));
       if (!callerId) {
         return new Response(JSON.stringify({ error: "Unauthorized" }), {
           status: 401,
@@ -243,22 +277,58 @@ export default async function handler(req: Request): Promise<Response> {
 
       const { userId, newPassword } = (await req.json()) as any;
       if (!userId || !newPassword || newPassword.length < 6) {
-        return new Response(JSON.stringify({ error: "Invalid password (minimum 6 characters)" }), {
+        return new Response(JSON.stringify({ error: "Password minimal 6 karakter" }), {
           status: 400,
           headers: { ...corsHeaders, "Content-Type": "application/json" },
         });
       }
 
-      // In Better Auth / neon_auth, users who haven't claimed password yet have is_claimed = false.
-      // Resetting marks them as unclaimed so they set password, or update neon_auth.account
-      await sql`
-        UPDATE public.allowed_customers SET is_claimed = false, claimed_at = NULL WHERE user_id = ${userId}::uuid;
+      // Check if user exists in neon_auth.user or profiles
+      const userRows = await sql`
+        SELECT id, email FROM neon_auth.user WHERE id = ${userId}::uuid LIMIT 1;
       `;
-      await sql`
-        DELETE FROM neon_auth.account WHERE "userId" = ${userId}::uuid AND "providerId" = 'credential';
+      if (userRows.length === 0) {
+        return new Response(JSON.stringify({ error: "User tidak ditemukan" }), {
+          status: 404,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+      const userEmail = userRows[0].email;
+
+      // Hash password using Better Auth compatible scrypt
+      const hashedPassword = hashPassword(newPassword);
+
+      // Check if credential account already exists in neon_auth.account
+      const existingAccount = await sql`
+        SELECT id FROM neon_auth.account 
+        WHERE "userId" = ${userId}::uuid AND "providerId" = 'credential' 
+        LIMIT 1;
       `;
 
-      return new Response(JSON.stringify({ success: true, message: "User password reset successfully" }), {
+      if (existingAccount.length > 0) {
+        await sql`
+          UPDATE neon_auth.account
+          SET password = ${hashedPassword}, "updatedAt" = NOW()
+          WHERE id = ${existingAccount[0].id};
+        `;
+      } else {
+        await sql`
+          INSERT INTO neon_auth.account (
+            "id", "accountId", "providerId", "userId", "password", "createdAt", "updatedAt"
+          ) VALUES (
+            gen_random_uuid(), ${userId}::text, 'credential', ${userId}::uuid, ${hashedPassword}, NOW(), NOW()
+          );
+        `;
+      }
+
+      // Mark allowed_customers as claimed
+      await sql`
+        UPDATE public.allowed_customers 
+        SET is_claimed = true, claimed_at = NOW(), user_id = ${userId}::uuid 
+        WHERE user_id = ${userId}::uuid OR lower(email) = lower(${userEmail});
+      `;
+
+      return new Response(JSON.stringify({ success: true, message: "Password berhasil direset" }), {
         status: 200,
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
@@ -304,15 +374,8 @@ export default async function handler(req: Request): Promise<Response> {
         });
       }
 
-      // Hash password with Better Auth compatible scrypt (salt hex + key hex)
-      const salt = crypto.randomBytes(16).toString("hex");
-      const key = crypto.scryptSync(password.normalize("NFKC"), salt, 64, {
-        N: 16384,
-        r: 16,
-        p: 1,
-        maxmem: 128 * 16384 * 16 * 2,
-      });
-      const hashedPassword = `${salt}:${key.toString("hex")}`;
+      // Hash password with Better Auth compatible scrypt
+      const hashedPassword = hashPassword(password);
 
       // Insert account
       await sql`

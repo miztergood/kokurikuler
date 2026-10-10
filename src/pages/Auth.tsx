@@ -56,13 +56,32 @@ const Auth = () => {
       return;
     }
     setLoading(true);
-    const { error } = await signUp(email, password, customerName);
-    if (error) {
-      setError(error.message);
+
+    // Try signUp first
+    const { error: signUpError } = await signUp(email, password, customerName);
+    if (signUpError) {
+      // Fallback: if user already exists in auth table, claim account via function
+      try {
+        const { error: claimError } = await supabase.functions.invoke("claim-account", {
+          body: { email, password },
+        });
+        if (claimError) {
+          setError(claimError.message || signUpError.message);
+          setLoading(false);
+          return;
+        }
+      } catch (err: any) {
+        setError(signUpError.message || "Gagal membuat password.");
+        setLoading(false);
+        return;
+      }
+    }
+
+    const { error: loginError } = await signIn(email, password);
+    if (loginError) {
+      setError(loginError.message);
     } else {
-      const { error: loginError } = await signIn(email, password);
-      if (loginError) setError(loginError.message);
-      else navigate("/app");
+      navigate("/app");
     }
     setLoading(false);
   };
@@ -72,8 +91,15 @@ const Auth = () => {
     setError("");
     setLoading(true);
     const { error } = await signIn(email, password);
-    if (error) setError(error.message);
-    else navigate("/app");
+    if (error) {
+      if (error.message?.includes("Invalid email or password") || error.message?.includes("invalid_credentials")) {
+        setError("Email atau password salah. Jika Anda belum pernah mengatur password atau lupa, silakan hubungi admin untuk reset password.");
+      } else {
+        setError(error.message);
+      }
+    } else {
+      navigate("/app");
+    }
     setLoading(false);
   };
 
@@ -236,6 +262,9 @@ const Auth = () => {
                   {loading ? "Memproses..." : "Masuk"}
                 </button>
               </form>
+              <p className="text-xs text-muted-foreground text-center mt-4">
+                Belum punya password atau lupa password? Hubungi admin untuk reset akun Anda.
+              </p>
             </>
           )}
         </div>
