@@ -16,6 +16,9 @@ const ERROR_MESSAGES: Record<string, string> = {
   invalid_key: "API Key tidak valid",
   model_not_found: "Model tidak tersedia",
   bad_request: "Format API Key salah",
+  missing_api_key: "Belum ada API Key aktif. Silakan tambahkan API Key Gemini Anda di atas.",
+  unauthorized: "Sesi login telah berakhir. Silakan muat ulang atau login kembali.",
+  rate_limit_exceeded: "Batas harian konten tercapai (akun trial).",
 };
 
 const GUIDE_STEPS = [
@@ -86,12 +89,14 @@ const UserSettings = () => {
         body: { type: "test", data: {} },
       });
       if (error) {
-        setTestResult({ success: false, error: "Gagal menghubungi server" });
-      } else {
+        setTestResult({ success: false, error: error.message || "Gagal menghubungi server" });
+      } else if (data) {
         setTestResult(data);
+      } else {
+        setTestResult({ success: false, error: "Tidak ada respons dari server" });
       }
-    } catch {
-      setTestResult({ success: false, error: "Gagal menghubungi server" });
+    } catch (err: any) {
+      setTestResult({ success: false, error: err?.message || "Gagal menghubungi server" });
     }
     setTesting(false);
   };

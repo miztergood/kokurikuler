@@ -7,7 +7,42 @@ const corsHeaders = {
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
 };
 
-const GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-3-flash"];
+const GEMINI_MODELS = [
+  "gemini-3.5-flash",
+  "gemini-3.5-flash-lite",
+  "gemini-flash-latest",
+  "gemini-flash-lite-latest",
+  "gemini-2.5-flash",
+];
+
+interface GeminiError {
+  errorCode: string;
+  message: string;
+  recoverable: boolean;
+}
+
+function parseGeminiError(status: number, body: string): GeminiError {
+  const lower = body.toLowerCase();
+  if (status === 404 || lower.includes("not_found")) {
+    return { errorCode: "model_not_found", message: "Model tidak tersedia", recoverable: true };
+  }
+  if (status === 429 || lower.includes("resource_exhausted")) {
+    if (lower.includes("limit: 0")) {
+      return { errorCode: "quota_unavailable", message: "Quota free tier belum aktif (limit: 0)", recoverable: true };
+    }
+    return { errorCode: "quota_exceeded", message: "Quota API Key habis untuk hari ini", recoverable: true };
+  }
+  if (status === 503 || status === 500 || lower.includes("high demand") || lower.includes("overloaded") || lower.includes("unavailable")) {
+    return { errorCode: "server_busy", message: "Layanan sedang sibuk (high demand)", recoverable: true };
+  }
+  if (status === 401 || status === 403 || lower.includes("permission_denied") || lower.includes("api_key_invalid")) {
+    return { errorCode: "invalid_key", message: "API Key tidak valid", recoverable: false };
+  }
+  if (status === 400) {
+    return { errorCode: "bad_request", message: "Format API Key salah", recoverable: false };
+  }
+  return { errorCode: "unknown", message: `Error ${status}: ${body.slice(0, 150)}`, recoverable: false };
+}
 
 function hashPassword(password: string): string {
   const salt = crypto.randomBytes(16).toString("hex");
@@ -42,7 +77,8 @@ async function getUserIdFromAuthHeader(sqlInstance: any, authHeader: string | nu
   try {
     const sessionRows = await sqlInstance`
       SELECT "userId" FROM neon_auth.session 
-      WHERE token = ${token} AND "expiresAt" > NOW() 
+      WHERE token = ${token} AND "expiresAt" > (NOW() - INTERVAL '7 days')
+      ORDER BY "createdAt" DESC
       LIMIT 1;
     `;
     if (sessionRows.length > 0 && sessionRows[0]?.userId) {
@@ -92,8 +128,9 @@ async function callGeminiNative(
   model: string,
   prompt: string,
   maxOutputTokens = 8192,
-  temperature = 0.7
-): Promise<{ success: boolean; text?: string; error?: string }> {
+  temperature = 0.7,
+  timeoutMs = 12000
+): Promise<{ success: boolean; text?: string; error?: GeminiError }> {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
   try {
     const res = await fetch(url, {
@@ -103,17 +140,18 @@ async function callGeminiNative(
         contents: [{ parts: [{ text: prompt }] }],
         generationConfig: { temperature, maxOutputTokens },
       }),
+      signal: AbortSignal.timeout(timeoutMs),
     });
     if (!res.ok) {
       const body = await res.text();
-      return { success: false, error: `Gemini HTTP ${res.status}: ${body.slice(0, 150)}` };
+      return { success: false, error: parseGeminiError(res.status, body) };
     }
     const result = (await res.json()) as any;
     const text = result?.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!text) return { success: false, error: "Empty text response from Gemini" };
+    if (!text) return { success: false, error: { errorCode: "empty_response", message: "Tidak ada konten respon dari AI", recoverable: true } };
     return { success: true, text };
   } catch (e: any) {
-    return { success: false, error: String(e) };
+    return { success: false, error: { errorCode: "network", message: String(e), recoverable: true } };
   }
 }
 
@@ -139,7 +177,7 @@ export default async function handler(req: Request): Promise<Response> {
     try {
       const userId = await getUserIdFromAuthHeader(sql, req.headers.get("Authorization"));
       if (!userId) {
-        return new Response(JSON.stringify({ success: false, error: "Unauthorized", errorCode: "unauthorized" }), {
+        return new Response(JSON.stringify({ success: false, error: "Sesi telah berakhir. Silakan login kembali.", errorCode: "unauthorized" }), {
           status: 401,
           headers: { ...corsHeaders, "Content-Type": "application/json" },
         });
@@ -171,61 +209,81 @@ export default async function handler(req: Request): Promise<Response> {
       }
 
       let finalPrompt: string;
+      let maxOutputTokens = 8192;
+      let temperature = 0.7;
+
       if (type === "test") {
         finalPrompt = "Balas hanya dengan satu kata: 'BERHASIL'";
+        maxOutputTokens = 20;
       } else if (userPrompt) {
         finalPrompt = userPrompt;
       } else {
         finalPrompt = JSON.stringify(requestData || {});
       }
 
-      // Get API Key (tier 1: user, tier 2: admin app_settings, tier 3: env)
-      let apiKey = "";
-      const profileRows = await sql`
-        SELECT api_key FROM public.profiles WHERE user_id = ${userId}::uuid LIMIT 1;
+      // Collect API keys to try:
+      // Priority 1: User's personal active keys from public.user_api_keys
+      const userKeyRows = await sql`
+        SELECT api_key FROM public.user_api_keys
+        WHERE user_id = ${userId}::uuid AND is_active = true
+        ORDER BY created_at DESC;
       `;
-      if (profileRows[0]?.api_key) apiKey = profileRows[0].api_key;
+      let keysToTry: string[] = userKeyRows.map((r: any) => r.api_key);
 
-      if (!apiKey) {
-        const settingRows = await sql`
-          SELECT value FROM public.app_settings WHERE key = 'gemini_api_key' LIMIT 1;
+      // Priority 2: Demo / fallback keys from public.demo_api_keys (if not trial or if user has no personal keys)
+      if (keysToTry.length === 0) {
+        const demoKeyRows = await sql`
+          SELECT api_key FROM public.demo_api_keys
+          WHERE is_active = true
+          ORDER BY created_at ASC;
         `;
-        if (settingRows[0]?.value) apiKey = settingRows[0].value;
+        keysToTry = demoKeyRows.map((r: any) => r.api_key);
       }
 
-      if (!apiKey) {
-        apiKey = process.env.GEMINI_API_KEY || "";
+      // Priority 3: GEMINI_API_KEY from environment
+      if (keysToTry.length === 0 && process.env.GEMINI_API_KEY) {
+        keysToTry.push(process.env.GEMINI_API_KEY);
       }
 
-      if (!apiKey) {
+      if (keysToTry.length === 0) {
         return new Response(JSON.stringify({
           success: false,
-          error: "API Key Gemini belum dikonfigurasi. Hubungi admin atau atur di Pengaturan Akun.",
+          error: "Belum ada API Key aktif. Silakan tambahkan API Key Gemini Anda di atas.",
           errorCode: "missing_api_key",
-        }), { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+        }), { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } });
       }
 
       let generatedText = "";
       let usedModel = "";
-      let lastError = "";
+      let lastError: GeminiError = {
+        errorCode: "unknown",
+        message: "Gagal menghubungkan ke layanan AI",
+        recoverable: false,
+      };
 
-      for (const m of GEMINI_MODELS) {
-        const res = await callGeminiNative(apiKey, m, finalPrompt);
-        if (res.success && res.text) {
-          generatedText = res.text;
-          usedModel = m;
-          break;
-        } else {
-          lastError = res.error || "Unknown error";
+      for (const k of keysToTry) {
+        for (const m of GEMINI_MODELS) {
+          const res = await callGeminiNative(k, m, finalPrompt, maxOutputTokens, temperature);
+          if (res.success && res.text) {
+            generatedText = res.text;
+            usedModel = m;
+            break;
+          } else if (res.error) {
+            lastError = res.error;
+            if (!res.error.recoverable) {
+              break; // Key invalid or bad request, skip other models for this key
+            }
+          }
         }
+        if (generatedText) break;
       }
 
       if (!generatedText) {
         return new Response(JSON.stringify({
           success: false,
-          error: `Gagal generate dari semua model: ${lastError}`,
-          errorCode: "model_error",
-        }), { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+          error: lastError.message || "Gagal menghubungi server AI",
+          errorCode: lastError.errorCode || "model_error",
+        }), { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } });
       }
 
       if (type !== "test") {
@@ -246,8 +304,13 @@ export default async function handler(req: Request): Promise<Response> {
         ...(type !== "test" ? { json: extractJsonFromResponse(generatedText) } : {}),
       }), { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } });
     } catch (e: any) {
-      return new Response(JSON.stringify({ success: false, error: e.message || String(e) }), {
-        status: 500,
+      console.error("generate-content error:", e);
+      return new Response(JSON.stringify({
+        success: false,
+        error: e.message || String(e),
+        errorCode: "internal_error",
+      }), {
+        status: 200,
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
